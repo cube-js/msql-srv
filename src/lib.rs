@@ -34,7 +34,7 @@
 //!         _: ParamParser,
 //!         results: QueryResultWriter<W>,
 //!     ) -> io::Result<()> {
-//!         results.completed(0, 0)
+//!         results.completed(0, 0, StatusFlags::empty())
 //!     }
 //!     fn on_close(&mut self, _: u32) {}
 //!

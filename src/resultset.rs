@@ -78,8 +78,8 @@ impl<'a, W: Write + 'a> StatementMetaWriter<'a, W> {
 }
 
 enum Finalizer {
-    Ok { rows: u64, last_insert_id: u64 },
-    EOF,
+    Ok { rows: u64, last_insert_id: u64, status: StatusFlags },
+    EOF { status: StatusFlags },
 }
 
 /// Convenience type for providing query results to clients.
@@ -117,17 +117,28 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     }
 
     fn finalize(&mut self, more_exists: bool) -> io::Result<()> {
-        let mut status = StatusFlags::empty();
-        if more_exists {
-            status.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
-        }
         match self.last_end.take() {
             None => Ok(()),
             Some(Finalizer::Ok {
                 rows,
                 last_insert_id,
-            }) => writers::write_ok_packet(self.writer, rows, last_insert_id, status),
-            Some(Finalizer::EOF) => writers::write_eof_packet(self.writer, status),
+                status
+            }) => {
+                let mut st = status.clone();
+                if more_exists {
+                    st.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
+                };
+
+                writers::write_ok_packet(self.writer, rows, last_insert_id, st)
+            },
+            Some(Finalizer::EOF { status }) => {
+                let mut st = status.clone();
+                if more_exists {
+                    st.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
+                };
+
+                writers::write_eof_packet(self.writer, st)
+            },
         }
     }
 
@@ -144,11 +155,12 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query in this resultset. `last_insert_id` may be given to communiate an identifier for
     /// a client's most recent insertion.
-    pub fn complete_one(mut self, rows: u64, last_insert_id: u64) -> io::Result<Self> {
+    pub fn complete_one(mut self, rows: u64, last_insert_id: u64, status: StatusFlags) -> io::Result<Self> {
         self.finalize(true)?;
         self.last_end = Some(Finalizer::Ok {
             rows,
             last_insert_id,
+            status,
         });
         Ok(self)
     }
@@ -156,8 +168,8 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
     /// Send an empty resultset response to the client indicating that `rows` rows were affected by
     /// the query. `last_insert_id` may be given to communiate an identifier for a client's most
     /// recent insertion.
-    pub fn completed(self, rows: u64, last_insert_id: u64) -> io::Result<()> {
-        self.complete_one(rows, last_insert_id)?.no_more_results()
+    pub fn completed(self, rows: u64, last_insert_id: u64, status: StatusFlags) -> io::Result<()> {
+        self.complete_one(rows, last_insert_id, status)?.no_more_results()
     }
 
     /// Reply to the client's query with an error.
@@ -363,10 +375,13 @@ impl<'a, W: Write + 'a> RowWriter<'a, W> {
             self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok {
                 rows: self.col as u64,
                 last_insert_id: 0,
+                status: StatusFlags::empty()
             });
         } else {
             // we wrote out at least one row
-            self.result.as_mut().unwrap().last_end = Some(Finalizer::EOF);
+            self.result.as_mut().unwrap().last_end = Some(Finalizer::EOF {
+                status: StatusFlags::empty()
+            });
         }
         Ok(())
     }

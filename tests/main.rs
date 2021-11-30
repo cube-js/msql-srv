@@ -4,6 +4,7 @@ extern crate mysql;
 extern crate mysql_common as myc;
 extern crate nom;
 
+use msql_srv::StatusFlags;
 use mysql::prelude::*;
 use std::io;
 use std::net;
@@ -62,7 +63,7 @@ where
         results: QueryResultWriter<net::TcpStream>,
     ) -> io::Result<()> {
         if query.eq_ignore_ascii_case("SELECT @@socket") || query.eq_ignore_ascii_case("SELECT @@wait_timeout") {
-            results.completed(0, 0)
+            results.completed(0, 0, StatusFlags::empty())
         } else {
             (self.on_q)(query, results)
         }
@@ -190,7 +191,7 @@ fn it_pings() {
 #[test]
 fn empty_response() {
     TestingShim::new(
-        |_, w| w.completed(0, 0),
+        |_, w| w.completed(0, 0, StatusFlags::empty()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
         |_, _| unreachable!(),
@@ -576,7 +577,7 @@ fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            w.completed(42, 1)
+            w.completed(42, 1, StatusFlags::empty())
         },
         |_, _| unreachable!(),
     )
@@ -727,7 +728,7 @@ fn prepared_empty() {
         |_| 0,
         move |_, params, w| {
             assert!(!params.is_empty());
-            w.completed(0, 0)
+            w.completed(0, 0, StatusFlags::empty())
         },
         |_, _| unreachable!(),
     )

@@ -11,7 +11,7 @@ use futures::{Future, IntoFuture};
 use mysql_async::prelude::*;
 use std::io;
 
-use msql_srv::{Column, ErrorKind, ParamParser, QueryResultWriter, StatementMetaWriter, AsyncMysqlShim, AsyncMysqlIntermediary};
+use msql_srv::{Column, ErrorKind, ParamParser, QueryResultWriter, StatementMetaWriter, AsyncMysqlShim, AsyncMysqlIntermediary, StatusFlags};
 use std::io::Cursor;
 use tokio::net::TcpListener;
 use async_trait::async_trait;
@@ -63,7 +63,7 @@ where
         results: QueryResultWriter<'a, Cursor<Vec<u8>>>,
     ) -> Result<(), Self::Error> {
         if query.eq_ignore_ascii_case("SELECT @@socket") || query.eq_ignore_ascii_case("SELECT @@wait_timeout") {
-            results.completed(0, 0)
+            results.completed(0, 0, StatusFlags::empty())
         } else {
             (self.on_q)(query, results)
         }
@@ -206,7 +206,7 @@ async fn it_pings() {
 #[tokio::test]
 async fn empty_response() {
     TestingShim::new(
-        |_, w| w.completed(0, 0),
+        |_, w| w.completed(0, 0, StatusFlags::empty()),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
     )
@@ -596,7 +596,7 @@ async fn insert_exec() {
             assert_eq!(Into::<&str>::into(params[5].value), "rsstoken199");
             assert_eq!(Into::<&str>::into(params[6].value), "mtok199");
 
-            w.completed(42, 1)
+            w.completed(42, 1, StatusFlags::empty())
         },
     )
     .with_params(params)
@@ -750,7 +750,7 @@ async fn prepared_empty() {
         |_| 0,
         move |_, params, w| {
             assert!(!params.is_empty());
-            w.completed(0, 0)
+            w.completed(0, 0, StatusFlags::empty())
         },
     )
     .with_params(params)
