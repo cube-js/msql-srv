@@ -2,13 +2,13 @@ use crate::myc::constants::{CapabilityFlags, Command as CommandByte};
 
 #[derive(Debug)]
 pub struct ClientHandshake {
-    capabilities: CapabilityFlags,
+    pub(crate) capabilities: CapabilityFlags,
     maxps: u32,
     collation: u16,
-    pub username: Vec<u8>,
-    pub auth: Vec<u8>,
-    pub database: Option<Vec<u8>>,
-    pub auth_plugin: Option<Vec<u8>>,
+    pub(crate) username: Vec<u8>,
+    pub(crate) auth: Vec<u8>,
+    pub(crate) database: Option<Vec<u8>>,
+    pub(crate) auth_plugin: Option<Vec<u8>>,
 }
 
 pub fn client_handshake(i: &[u8]) -> nom::IResult<&[u8], ClientHandshake> {

@@ -102,14 +102,16 @@ enum Finalizer {
 #[must_use]
 pub struct QueryResultWriter<'a, W: Write> {
     // XXX: specialization instead?
+    pub(crate) eof_deprecated: bool,
     pub(crate) is_bin: bool,
     pub(crate) writer: &'a mut PacketWriter<W>,
     last_end: Option<Finalizer>,
 }
 
 impl<'a, W: Write> QueryResultWriter<'a, W> {
-    pub(crate) fn new(writer: &'a mut PacketWriter<W>, is_bin: bool) -> Self {
+    pub(crate) fn new(writer: &'a mut PacketWriter<W>, is_bin: bool, eof_deprecated: bool) -> Self {
         QueryResultWriter {
+            eof_deprecated,
             is_bin,
             writer,
             last_end: None,
@@ -137,7 +139,11 @@ impl<'a, W: Write> QueryResultWriter<'a, W> {
                     st.set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
                 };
 
-                writers::write_eof_packet(self.writer, st)
+                if self.eof_deprecated {
+                    writers::write_ok_packet(self.writer, 0, 0, st)
+                } else {
+                    writers::write_eof_packet(self.writer, st)
+                }
             },
         }
     }

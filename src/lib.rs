@@ -101,6 +101,7 @@ use std::io::prelude::*;
 use std::iter;
 use std::net;
 use async_trait::async_trait;
+use myc::constants::CapabilityFlags;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::io::AsyncRead;
 
@@ -289,6 +290,7 @@ pub trait AsyncMysqlShim<W: Write + Send> {
 /// that implements [`MysqlShim`](trait.MysqlShim.html).
 pub struct MysqlIntermediary<B, R: Read, W: Write> {
     shim: B,
+    capatibilities: Option<CapabilityFlags>,
     reader: packet::PacketReader<R>,
     writer: packet::PacketWriter<W>,
 }
@@ -327,6 +329,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
         let w = packet::PacketWriter::new(writer);
         let mut mi = MysqlIntermediary {
             shim,
+            capatibilities: None,
             reader: r,
             writer: w,
         };
@@ -347,7 +350,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     "peer terminated connection",
                 )
             })?;
-            let _handshake = commands::client_handshake(&handshake)
+            let handshake = commands::client_handshake(&handshake)
                 .map_err(|e| match e {
                     nom::Err::Incomplete(_) => io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -370,6 +373,8 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                 })?
                 .1;
             self.writer.set_seq(seq + 1);
+
+            self.capatibilities = Some(handshake.capabilities);
         }
 
         writers::write_ok_packet(&mut self.writer, 0, 0, StatusFlags::empty())?;
@@ -381,6 +386,12 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
     fn run(mut self) -> Result<(), B::Error> {
         use crate::commands::Command;
 
+        let eof_deprecated = if let Some(c) = &self.capatibilities  {
+            c.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+        } else {
+            false
+        };
+
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some((seq, packet)) = self.reader.next()? {
             self.writer.set_seq(seq + 1);
@@ -388,7 +399,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
             match cmd {
                 Command::Query(q) => {
                     if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(&mut self.writer, false, eof_deprecated);
                         let var = &q[b"SELECT @@".len()..];
                         match var {
                             b"max_allowed_packet" => {
@@ -428,7 +439,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                         let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                         self.shim.on_init(&schema, w)?;
                     } else {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(&mut self.writer, false, eof_deprecated);
                         self.shim.on_query(
                             ::std::str::from_utf8(q)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
@@ -457,7 +468,7 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
                     })?;
                     {
                         let params = params::ParamParser::new(params, state);
-                        let w = QueryResultWriter::new(&mut self.writer, true);
+                        let w = QueryResultWriter::new(&mut self.writer, true, eof_deprecated);
                         self.shim.on_execute(stmt, params, w)?;
                     }
                     state.long_data.clear();
@@ -517,6 +528,8 @@ impl<B: MysqlShim<W>, R: Read, W: Write> MysqlIntermediary<B, R, W> {
 /// that implements [`MysqlShim`](trait.MysqlShim.html).
 pub struct AsyncMysqlIntermediary<B, R: AsyncRead + AsyncWrite + Unpin> {
     shim: B,
+    // Client capatibilities
+    capatibilities: Option<CapabilityFlags>,
     reader: packet::PacketReader<R>,
     writer: packet::PacketWriter<Cursor<Vec<u8>>>
 }
@@ -529,6 +542,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
         let w = packet::PacketWriter::new(Cursor::new(Vec::new()));
         let mut mi = AsyncMysqlIntermediary {
             shim,
+            capatibilities: None,
             reader: r,
             writer: w
         };
@@ -576,6 +590,8 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
             self.writer.set_seq(seq + 1);
             handshake
         };
+
+        self.capatibilities = Some(handshake.capabilities);
 
         let auth_option = match self.shim.on_auth(handshake.username.to_vec()).await {
             Err(_) => {
@@ -638,6 +654,12 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
     async fn run(mut self) -> Result<(), B::Error> {
         use crate::commands::Command;
 
+        let eof_deprecated = if let Some(c) = &self.capatibilities  {
+            c.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+        } else {
+            false
+        };
+
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some((seq, packet)) = self.reader.next_async().await? {
             self.writer.set_seq(seq + 1);
@@ -645,7 +667,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
             match cmd {
                 Command::Query(q) => {
                     if q.starts_with(b"SELECT @@") || q.starts_with(b"select @@") {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(&mut self.writer, false, eof_deprecated);
                         let var = &q[b"SELECT @@".len()..];
                         match var {
                             b"max_allowed_packet" => {
@@ -674,7 +696,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
                         let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                         self.shim.on_init(&schema, w).await?;
                     } else {
-                        let w = QueryResultWriter::new(&mut self.writer, false);
+                        let w = QueryResultWriter::new(&mut self.writer, false, eof_deprecated);
                         self.shim.on_query(
                             ::std::str::from_utf8(q)
                                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
@@ -703,7 +725,7 @@ impl<B: AsyncMysqlShim<Cursor<Vec<u8>>> + Send, R: AsyncRead + AsyncWrite + Unpi
                     })?;
                     {
                         let params = params::ParamParser::new(params, state);
-                        let w = QueryResultWriter::new(&mut self.writer, true);
+                        let w = QueryResultWriter::new(&mut self.writer, true, eof_deprecated);
                         self.shim.on_execute(stmt, params, w).await?;
                     }
                     state.long_data.clear();
