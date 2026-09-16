@@ -530,7 +530,7 @@ impl ToMysqlValue for Duration {
                 if us != 0 {
                     w.write_u8(12u8)?;
                 } else {
-                    w.write_u8(9u8)?;
+                    w.write_u8(8u8)?;
                 }
 
                 w.write_u8(0u8)?; // positive only (for now)
@@ -661,11 +661,31 @@ impl ToMysqlValue for myc::value::Value {
 #[allow(unused_imports)]
 mod tests {
     use super::ToMysqlValue;
-    use crate::myc::value;
+    use crate::myc::constants::{ColumnFlags as MycColumnFlags, ColumnType as MycColumnType};
+    use crate::myc::io::ParseBuf;
+    use crate::myc::proto::MyDeserialize;
     use crate::myc::value::convert::from_value;
+    use crate::myc::value::{BinValue, TextValue, Value as MycValue, ValueDeserializer};
     use crate::{Column, ColumnFlags, ColumnType};
     use chrono::{self, TimeZone};
     use std::time;
+
+    fn read_text_value(data: &[u8]) -> MycValue {
+        ValueDeserializer::<TextValue>::deserialize((), &mut ParseBuf(data))
+            .unwrap()
+            .0
+    }
+
+    fn read_bin_value(data: &[u8], ct: MycColumnType, unsigned: bool) -> MycValue {
+        let flags = if unsigned {
+            MycColumnFlags::UNSIGNED_FLAG
+        } else {
+            MycColumnFlags::empty()
+        };
+        ValueDeserializer::<BinValue>::deserialize((ct, flags), &mut ParseBuf(data))
+            .unwrap()
+            .0
+    }
 
     mod roundtrip_text {
         use super::*;
@@ -678,7 +698,7 @@ mod tests {
                     let v: $t = $v;
                     v.to_mysql_text(&mut data).unwrap();
                     assert_eq!(
-                        from_value::<$t>(value::read_text_value(&mut &data[..]).unwrap()),
+                        from_value::<$t>(read_text_value(&data[..])),
                         v
                     );
                 }
@@ -748,9 +768,7 @@ mod tests {
                     let v: $t = $v;
                     v.to_mysql_bin(&mut data, &col).unwrap();
                     assert_eq!(
-                        from_value::<$t>(
-                            value::read_bin_value(&mut &data[..], $ct, !$sig).unwrap()
-                        ),
+                        from_value::<$t>(read_bin_value(&data[..], $ct, !$sig)),
                         v
                     );
                 }

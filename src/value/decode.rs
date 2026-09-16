@@ -283,7 +283,7 @@ impl<'a> Into<Duration> for Value<'a> {
 mod tests {
     use super::Value;
     use crate::myc;
-    use crate::myc::io::WriteMysqlExt;
+    use crate::myc::proto::MySerialize;
     use crate::{Column, ColumnFlags, ColumnType};
     use chrono::{self, TimeZone};
     use std::time;
@@ -308,7 +308,7 @@ mod tests {
                 }
 
                 let v: $t = $v;
-                data.write_bin_value(&myc::value::Value::from(v)).unwrap();
+                myc::value::Value::from(v).serialize(&mut data);
                 assert_eq!(
                     Into::<$t>::into(Value::parse_from(&mut &data[..], $ct, !$sig).unwrap()),
                     v

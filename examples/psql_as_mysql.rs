@@ -9,6 +9,7 @@ extern crate slab;
 
 use msql_srv::*;
 use mysql::prelude::*;
+use postgres::types::{ToSql, Type};
 use slab::Slab;
 
 use std::io;
@@ -21,18 +22,16 @@ fn main() {
 
     let jh = thread::spawn(move || {
         if let Ok((s, _)) = listener.accept() {
-            let conn = postgres::Connection::connect(
-                "postgresql://postgres@localhost:5432",
-                postgres::TlsMode::None,
-            )
-            .unwrap();
-            MysqlIntermediary::run_on_tcp(Postgres::new(conn), s).unwrap();
+            let client =
+                postgres::Client::connect("postgresql://postgres@localhost:5432", postgres::NoTls)
+                    .unwrap();
+            MysqlIntermediary::run_on_tcp(Postgres::new(client), s).unwrap();
         }
     });
 
     // we connect using MySQL bindings, but no MySQL server is running!
-    let mut db = mysql::Conn::new(&format!("mysql://127.0.0.1:{}", port)).unwrap();
-    assert_eq!(db.ping(), true);
+    let mut db = mysql::Conn::new(format!("mysql://127.0.0.1:{}", port).as_str()).unwrap();
+    assert!(db.ping().is_ok());
     {
         let mut results = db
             .query_iter("SELECT INT4(1) AS foo, INT8(1) AS bar, 'BAZ' AS baz")
@@ -91,59 +90,72 @@ fn main() {
 
 // this is where the proxy server implementation starts
 
-struct Prepared<'a> {
-    stmt: postgres::stmt::Statement<'a>,
+/// `MysqlShim::Error` must be constructible from `io::Error`, which `postgres::Error` is not.
+#[derive(Debug)]
+enum Error {
+    Io(io::Error),
+    Postgres(postgres::Error),
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl From<postgres::Error> for Error {
+    fn from(e: postgres::Error) -> Self {
+        Error::Postgres(e)
+    }
+}
+
+struct Prepared {
+    stmt: postgres::Statement,
     params: Vec<Column>,
 }
 
 struct Postgres {
-    connection: postgres::Connection,
-    // NOTE: not *actually* static, but tied to our connection's lifetime.
-    prepared: Slab<Prepared<'static>>,
+    client: postgres::Client,
+    prepared: Slab<Prepared>,
 }
 
 impl Postgres {
-    fn new(c: postgres::Connection) -> Self {
+    fn new(c: postgres::Client) -> Self {
         Postgres {
-            connection: c,
+            client: c,
             prepared: Slab::new(),
         }
     }
 }
 
 impl<W: io::Write> MysqlShim<W> for Postgres {
-    type Error = postgres::Error;
+    type Error = Error;
 
     fn on_prepare(&mut self, query: &str, info: StatementMetaWriter<W>) -> Result<(), Self::Error> {
-        match self.connection.prepare(query) {
+        match self.client.prepare(query) {
             Ok(stmt) => {
                 // the PostgreSQL server will tell us about the parameter types and output columns
                 // of the query we just prepared. we now need to communicate this back to our MySQL
                 // client, which requires translating between psql and mysql types.
-                use std::mem;
                 let params: Vec<_> = stmt
-                    .param_types()
-                    .into_iter()
-                    .map(|t| {
-                        let ct = p2mt(t);
-                        Column {
-                            table: t.schema().to_owned(),
-                            column: t.name().to_owned(),
-                            coltype: ct,
-                            colflags: ColumnFlags::empty(),
-                        }
+                    .params()
+                    .iter()
+                    .map(|t| Column {
+                        table: t.schema().to_owned(),
+                        column: t.name().to_owned(),
+                        coltype: p2mt(t),
+                        colflags: ColumnFlags::empty(),
                     })
                     .collect();
                 let columns: Vec<_> = stmt
                     .columns()
-                    .into_iter()
+                    .iter()
                     .map(|c| {
                         let t = c.type_();
-                        let ct = p2mt(t);
                         Column {
                             table: t.schema().to_owned(),
                             column: c.name().to_owned(),
-                            coltype: ct,
+                            coltype: p2mt(t),
                             colflags: ColumnFlags::empty(),
                         }
                     })
@@ -151,27 +163,18 @@ impl<W: io::Write> MysqlShim<W> for Postgres {
 
                 // keep track of the parameter types so we can decode the values provided by the
                 // client when they later execute this statement.
-                let stmt = Prepared { stmt, params };
-
-                // the statement is tied to the connection, which as far as the compiler is aware
-                // we only know lives for as long as the `&mut self` given to this function.
-                // however, *we* know that the connection will live at least as long as the
-                // prepared statement we insert into `self.prepared` (because there is no way to
-                // get the prepared statements out!).
-                let stmt = unsafe { mem::transmute(stmt) };
-
-                let id = self.prepared.insert(stmt);
+                let id = self.prepared.insert(Prepared { stmt, params });
                 let stmt = &self.prepared[id];
                 info.reply(id as u32, &stmt.params, &columns)?;
                 Ok(())
             }
             Err(e) => {
-                if let Some(db) = e.as_db() {
-                    info.error(ErrorKind::ER_NO, db.message.as_bytes())?;
+                if let Some(db) = e.as_db_error() {
+                    info.error(ErrorKind::ER_NO, db.message().as_bytes())?;
                     return Ok(());
                 }
 
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -182,49 +185,37 @@ impl<W: io::Write> MysqlShim<W> for Postgres {
         ps: ParamParser,
         results: QueryResultWriter<W>,
     ) -> Result<(), Self::Error> {
-        match self.prepared.get_mut(id as usize) {
-            None => Ok(results.error(ErrorKind::ER_NO, b"no such prepared statement")?),
-            Some(&mut Prepared { ref mut stmt, .. }) => {
-                // this is a little nasty because we have to take MySQL-encoded arguments and
-                // massage them into &ToSql things, which is what postgres::Statement::query takes.
-                // we can only do that by first boxing all the values (so they can be kept in a
-                // single vec), and then collecting a *second* vec with references to those, and
-                // *then* take a slice of that vec.
-                let args: Vec<Box<dyn postgres::types::ToSql>> = ps
-                    .into_iter()
-                    .map(|p| match p.coltype {
-                        ColumnType::MYSQL_TYPE_SHORT => {
-                            Box::new(Into::<i16>::into(p.value)) as Box<_>
-                        }
-                        ColumnType::MYSQL_TYPE_LONG => {
-                            Box::new(Into::<i32>::into(p.value)) as Box<_>
-                        }
-                        ColumnType::MYSQL_TYPE_LONGLONG => {
-                            Box::new(Into::<i64>::into(p.value)) as Box<_>
-                        }
-                        ColumnType::MYSQL_TYPE_FLOAT => {
-                            Box::new(Into::<f32>::into(p.value)) as Box<_>
-                        }
-                        ColumnType::MYSQL_TYPE_DOUBLE => {
-                            Box::new(Into::<f64>::into(p.value)) as Box<_>
-                        }
-                        ColumnType::MYSQL_TYPE_STRING => {
-                            Box::new(Into::<&str>::into(p.value)) as Box<_>
-                        }
-                        ct => unimplemented!(
-                            "don't know how to translate PostgreSQL \
-                             argument type {:?} into MySQL value",
-                            ct
-                        ),
-                    })
-                    .collect();
-                let args: Vec<_> = args.iter().map(|a| &**a).collect();
+        let stmt = match self.prepared.get(id as usize) {
+            None => return Ok(results.error(ErrorKind::ER_NO, b"no such prepared statement")?),
+            Some(Prepared { stmt, .. }) => stmt.clone(),
+        };
 
-                // lazy_query unfortunately gets us into all sorts of lifetime trouble it seems...
-                // so we do it eagerly instead.
-                answer_rows(results, stmt.query(&args[..]))
-            }
-        }
+        // this is a little nasty because we have to take MySQL-encoded arguments and massage
+        // them into &(dyn ToSql + Sync) things, which is what postgres::Client::query takes.
+        // we can only do that by first boxing all the values (so they can be kept in a single
+        // vec), and then collecting a *second* vec with references to those.
+        let args: Vec<Box<dyn ToSql + Sync>> = ps
+            .into_iter()
+            .map(|p| match p.coltype {
+                ColumnType::MYSQL_TYPE_SHORT => Box::new(Into::<i16>::into(p.value)) as Box<_>,
+                ColumnType::MYSQL_TYPE_LONG => Box::new(Into::<i32>::into(p.value)) as Box<_>,
+                ColumnType::MYSQL_TYPE_LONGLONG => Box::new(Into::<i64>::into(p.value)) as Box<_>,
+                ColumnType::MYSQL_TYPE_FLOAT => Box::new(Into::<f32>::into(p.value)) as Box<_>,
+                ColumnType::MYSQL_TYPE_DOUBLE => Box::new(Into::<f64>::into(p.value)) as Box<_>,
+                ColumnType::MYSQL_TYPE_STRING => {
+                    Box::new(Into::<&str>::into(p.value).to_owned()) as Box<_>
+                }
+                ct => unimplemented!(
+                    "don't know how to translate PostgreSQL \
+                     argument type {:?} into MySQL value",
+                    ct
+                ),
+            })
+            .collect();
+        let args: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| &**a).collect();
+
+        let rows = self.client.query(&stmt, &args[..]);
+        answer_rows(results, rows)
     }
 
     fn on_close(&mut self, id: u32) {
@@ -232,39 +223,35 @@ impl<W: io::Write> MysqlShim<W> for Postgres {
     }
 
     fn on_query(&mut self, query: &str, results: QueryResultWriter<W>) -> Result<(), Self::Error> {
-        answer_rows(results, self.connection.query(query, &[]))
-    }
-}
-
-impl Drop for Postgres {
-    fn drop(&mut self) {
-        // drop all the prepared statements *first*.
-        self.prepared.clear();
-        // *then* we can drop the connection (implicitly done).
+        let rows = self.client.query(query, &[]);
+        answer_rows(results, rows)
     }
 }
 
 /// Take a set of rows from PostgreSQL and re-encode them as MySQL rows
 fn answer_rows<W: io::Write>(
     results: QueryResultWriter<W>,
-    rows: postgres::Result<postgres::rows::Rows>,
-) -> Result<(), postgres::Error> {
+    rows: Result<Vec<postgres::Row>, postgres::Error>,
+) -> Result<(), Error> {
     match rows {
         Ok(rows) => {
             let cols: Vec<_> = rows
-                .columns()
-                .into_iter()
-                .map(|c| {
-                    let t = c.type_();
-                    let ct = p2mt(t);
-                    Column {
-                        table: t.schema().to_owned(),
-                        column: c.name().to_owned(),
-                        coltype: ct,
-                        colflags: ColumnFlags::empty(),
-                    }
+                .first()
+                .map(|r| {
+                    r.columns()
+                        .iter()
+                        .map(|c| {
+                            let t = c.type_();
+                            Column {
+                                table: t.schema().to_owned(),
+                                column: c.name().to_owned(),
+                                coltype: p2mt(t),
+                                colflags: ColumnFlags::empty(),
+                            }
+                        })
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
 
             let mut writer = results.start(&cols)?;
             for row in &rows {
@@ -299,23 +286,17 @@ fn answer_rows<W: io::Write>(
 }
 
 /// Convert a PostgreSQL data type and translate it into the corresponding MySQL type
-fn p2mt(t: &postgres::types::Type) -> msql_srv::ColumnType {
-    if let postgres::types::Kind::Simple = *t.kind() {
-        match postgres::types::Type::from_oid(t.oid()) {
-            Some(postgres::types::INT2) => msql_srv::ColumnType::MYSQL_TYPE_SHORT,
-            Some(postgres::types::INT4) => msql_srv::ColumnType::MYSQL_TYPE_LONG,
-            Some(postgres::types::INT8) => msql_srv::ColumnType::MYSQL_TYPE_LONGLONG,
-            Some(postgres::types::FLOAT4) => msql_srv::ColumnType::MYSQL_TYPE_FLOAT,
-            Some(postgres::types::FLOAT8) => msql_srv::ColumnType::MYSQL_TYPE_DOUBLE,
-            Some(postgres::types::TEXT) => msql_srv::ColumnType::MYSQL_TYPE_STRING,
-            t => {
-                unimplemented!(
-                    "don't know how to translate PostgreSQL type {:?} to a MySQL type",
-                    t
-                );
-            }
-        }
-    } else {
-        unimplemented!();
+fn p2mt(t: &Type) -> msql_srv::ColumnType {
+    match *t {
+        Type::INT2 => msql_srv::ColumnType::MYSQL_TYPE_SHORT,
+        Type::INT4 => msql_srv::ColumnType::MYSQL_TYPE_LONG,
+        Type::INT8 => msql_srv::ColumnType::MYSQL_TYPE_LONGLONG,
+        Type::FLOAT4 => msql_srv::ColumnType::MYSQL_TYPE_FLOAT,
+        Type::FLOAT8 => msql_srv::ColumnType::MYSQL_TYPE_DOUBLE,
+        Type::TEXT => msql_srv::ColumnType::MYSQL_TYPE_STRING,
+        ref t => unimplemented!(
+            "don't know how to translate PostgreSQL type {:?} to a MySQL type",
+            t
+        ),
     }
 }

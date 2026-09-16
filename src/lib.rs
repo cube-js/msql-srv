@@ -73,8 +73,8 @@
 //!         }
 //!     });
 //!
-//!     let mut db = mysql::Conn::new(&format!("mysql://127.0.0.1:{}", port)).unwrap();
-//!     assert_eq!(db.ping(), true);
+//!     let mut db = mysql::Conn::new(format!("mysql://127.0.0.1:{}", port).as_str()).unwrap();
+//!     assert!(db.ping().is_ok());
 //!     assert_eq!(db.query_iter("SELECT a, b FROM foo").unwrap().count(), 1);
 //!     drop(db);
 //!     jh.join().unwrap();

@@ -106,7 +106,7 @@ where
             MysqlIntermediary::run_on_tcp(self, s)
         });
 
-        let mut db = mysql::Conn::new(&format!("mysql://127.0.0.1:{}", port)).unwrap();
+        let mut db = mysql::Conn::new(format!("mysql://127.0.0.1:{}", port).as_str()).unwrap();
         c(&mut db);
         drop(db);
         jh.join().unwrap().unwrap();
@@ -135,7 +135,7 @@ fn it_inits_ok() {
             writer.ok()
         },
     )
-    .test(|db| assert_eq!(true, db.select_db("test")));
+    .test(|db| assert_eq!(true, db.select_db("test").is_ok()));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn it_inits_error() {
             )
         },
     )
-    .test(|db| assert_eq!(false, db.select_db("test")));
+    .test(|db| assert_eq!(false, db.select_db("test").is_ok()));
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn it_pings() {
         |_, _, _| unreachable!(),
         |_, _| unreachable!(),
     )
-    .test(|db| assert_eq!(db.ping(), true))
+    .test(|db| assert_eq!(db.ping().is_ok(), true))
 }
 
 #[test]
@@ -368,14 +368,14 @@ fn multi_result() {
         let mut result = db
             .query_iter("SELECT a FROM foo; SELECT a FROM foo")
             .unwrap();
-        let mut set = result.next_set().unwrap().unwrap();
+        let mut set = result.next_set().unwrap();
         let row1: Vec<_> = set
             .by_ref()
             .filter_map(|row| row.unwrap().get::<i16, _>(0))
             .collect();
         assert_eq!(row1, vec![1024]);
         drop(set);
-        let mut set = result.next_set().unwrap().unwrap();
+        let mut set = result.next_set().unwrap();
         let row2: Vec<_> = set
             .by_ref()
             .filter_map(|row| row.unwrap().get::<i16, _>(0))
